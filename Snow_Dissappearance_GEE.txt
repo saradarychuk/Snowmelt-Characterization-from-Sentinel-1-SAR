@@ -1,0 +1,594 @@
+/**** Start of imports. If edited, may not auto-convert in the playground. ****/
+var LJB = ee.FeatureCollection("users/saradarychuk/LaJoie_Basin"),
+    ice_train = 
+    /* color: #ffc82d */
+    /* shown: false */
+    ee.Geometry.MultiPolygon(
+        [[[[-123.91743215716797, 50.89189717701194],
+           [-123.9030126015039, 50.896661320046],
+           [-123.89236959613281, 50.897527475511],
+           [-123.88550314105468, 50.896661320046],
+           [-123.87657674945312, 50.88778229764508],
+           [-123.86833700335937, 50.88150099144319],
+           [-123.85597738421875, 50.87608539257154],
+           [-123.83812460101562, 50.870019174601445],
+           [-123.82816824115234, 50.8635187791728],
+           [-123.82439169085937, 50.85723420198054],
+           [-123.79967245257812, 50.84466250641749],
+           [-123.79177602923828, 50.844879288495896],
+           [-123.77426656878906, 50.84661350886128],
+           [-123.75710043109375, 50.84921471853747],
+           [-123.74165090716797, 50.851599033323716],
+           [-123.73015361180957, 50.86460182864018],
+           [-123.7123858119141, 50.85073178546909],
+           [-123.67706646292237, 50.857017197032185],
+           [-123.68294301143418, 50.868935161623405],
+           [-123.72036489642578, 50.88323385015534],
+           [-123.76705679095703, 50.859618106832144],
+           [-123.77598318255859, 50.85571710816759],
+           [-123.78937276996093, 50.85680075164136],
+           [-123.80035909808593, 50.861568483792375],
+           [-123.80894216693359, 50.86871916802801],
+           [-123.82336172259765, 50.87586875552518],
+           [-123.83366140521484, 50.8804179220203],
+           [-123.85597738421875, 50.886482786533534],
+           [-123.869710294375, 50.89341309356797],
+           [-123.8810399452539, 50.90012584524449],
+           [-123.88996633685547, 50.902940582171816],
+           [-123.89820608294922, 50.90250755679696],
+           [-123.92052206195312, 50.89579514847058]]],
+         [[[-123.8752034584375, 50.773720739123306],
+           [-123.84533301793681, 50.76243132668939],
+           [-123.83331808246093, 50.7676412067436],
+           [-123.84911092914062, 50.77719440288017],
+           [-123.87828955864748, 50.78522876532004],
+           [-123.90198263324218, 50.7906524132095],
+           [-123.8902999827491, 50.782188845442626]]],
+         [[[-123.85180215776167, 50.759921002718656],
+           [-123.85918359697065, 50.75731481699011],
+           [-123.87617807328901, 50.74808340856166],
+           [-123.8948891633769, 50.748300639086835],
+           [-123.89282922685346, 50.74047970514359],
+           [-123.88218622148237, 50.73493908651448],
+           [-123.87531976640425, 50.742652317835656],
+           [-123.84665231645307, 50.75405688072695]]]]),
+    imageVisParam_cluster = {"opacity":1,"bands":["cluster"],"min":0,"max":1,"palette":["a0e2ed","007fda"]},
+    imageVisParam_snowfree = {"opacity":1,"bands":["calDoy"],"min":60,"max":273,"palette":["dcffff","005ab6"]},
+    ljb_ice_mask = ee.FeatureCollection("users/saradarychuk/icemask_randomforest_edited"),
+    ICE = ee.FeatureCollection("users/saradarychuk/icemask_randomforest_edited");
+/***** End of imports. If edited, may not auto-convert in the playground. *****/
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+//Snow Disappearance Estimates in Glacierized Basins 
+//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+//Get snow free dates from Landsat and Sentinel-2 Images 
+//Uses cluster analysis - a training area is required
+
+// From Darychuk et al. (2023) 
+// "Snowmelt Characterization from Optical and Synthetic Aperture Radar Observations in the La Joie Basin, British Columbia"
+// Author: S. Darychuk
+
+//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+//PARAMETERS /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+//Output folder for optical composites 
+var fol = "Optical_Snow_Disapearance_Estimates"
+
+//Resolution for exported map 
+var resolution = 30
+
+//Study Period  
+var ts_start = '2018-03-01'; //Start of Time Series
+var ts_end   = '2018-10-01'; //End of Time Series 
+
+var startYear = 2018 //Start Year
+
+//Create a water Mask using the global surface water dataset (Pekel et al. 2016)
+var waterOcc = ee.Image("JRC/GSW1_0/GlobalSurfaceWater").select('occurrence'),
+    jrc_data0 = ee.Image("JRC/GSW1_0/Metadata").select('total_obs').lte(0),
+    waterOccFilled = waterOcc.unmask(0).max(jrc_data0),
+    waterMask = waterOccFilled.lt(60)
+
+//Study Area 
+var aoi = LJB
+var aoi_train = ice_train //VECTOR
+var aoi_test = ljb_ice_mask //RASTER
+
+//Maximum Cloud Cover to allow in anlaysis images 
+//Needs to be left low 
+var max_cloudy_percent = 30; 
+
+//Standardized Band Names for Image Fusion 
+  var L8_BANDS  = ['B1', 'B2', 'B3', 'B4', 'B5', 'B6', 'B7', 'B10']; // Landsat OLI (8)
+  var S2_BANDS  = ['B1', 'B2', 'B3', 'B4', 'B8', 'B11', 'B12', 'B12']; // Sentinel-2
+  var STD_NAMES = ['blue2', 'blue', 'green', 'red', 'nir', 'swir1', 'swir2', 'tir',]; // Common Band Names
+
+// Create an equal filter to match image collections
+var filter = ee.Filter.equals({
+  leftField: 'system:index',
+  rightField: 'system:index'
+});
+
+// Create a simple join
+var simpleJoin = ee.Join.simple();    
+
+//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// FUNCTIONS /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+//Use QA Data for Sentinel for Cloud Masking 
+var computeQAbits = function(image, start, end, newName) {
+    var pattern = 0;
+
+    for (var i=start; i<=end; i++) {
+        pattern += Math.pow(2, i);
+    }
+
+    return image.select([0], [newName]).bitwiseAnd(pattern).rightShift(start);
+};
+
+//Create Function to mask clouds in sentinel-2 images
+var sentinel2 = function(image) {
+
+  var cloud_mask = image.select("QA60");
+  var opaque = computeQAbits(cloud_mask, 10, 10, "opaque");
+  var cirrus = computeQAbits(cloud_mask, 11, 11, "cirrus");
+  var mask = opaque.or(cirrus);
+
+  return image.updateMask(mask.not());
+}
+
+  
+// Landsat TM, ETM+ and OLI Cloud Mask for testing data
+  var cloudMask_test = function(img){
+    
+    var temp = img.addBands(img.select('tir').unitScale(240,270)); 
+    temp = temp.addBands(temp.normalizedDifference(['tir_1','swir2']))
+    temp = temp.addBands(temp.select('nd').gt(0.4).rename('clear'));
+    temp = temp.addBands(temp.select('nd').lte(0.4).rename('cloud'));
+    var mask = ee.Image(1).updateMask(temp.select('cloud')).byte().reduceToVectors({geometry: aoi_test, scale: resolution, maxPixels: 1e13})
+      .map(function(ft){return ft})
+    var maskImg = ee.Image(1).subtract(ee.Image(1).clipToCollection(mask).unmask())
+    
+    return img.updateMask(maskImg)}
+    
+// Landsat TM, ETM+ and OLI Cloud Mask for training data
+  var cloudMask_train = function(img){
+    
+    var temp = img.addBands(img.select('tir').unitScale(240,270)); 
+    temp = temp.addBands(temp.normalizedDifference(['tir_1','swir2']))
+    temp = temp.addBands(temp.select('nd').gt(0.4).rename('clear'));
+    temp = temp.addBands(temp.select('nd').lte(0.4).rename('cloud'));
+    var mask = ee.Image(1).updateMask(temp.select('cloud')).byte().reduceToVectors({geometry: aoi_train, scale: resolution, maxPixels: 1e13})
+      .map(function(ft){return ft})
+    var maskImg = ee.Image(1).subtract(ee.Image(1).clipToCollection(mask).unmask())
+    
+    return img.updateMask(maskImg)}
+
+//Algorithm for Addding Date Bands to images (for extracting the snow on/ snow off dates)
+function addDateBands(img) {
+  var date = img.date();
+  var calDoy = date.getRelative('day', 'year');
+  var relDoy = date.difference(ts_start, 'day');
+  var millis = date.millis();
+  var dateBands = ee.Image.constant([calDoy, relDoy, millis, startYear])
+    .rename(['calDoy', 'relDoy', 'millis', 'year']);
+  return img.addBands(dateBands).toInt16().set('millis', millis);
+}
+
+//Masking function
+var maskInside = function(image, geometry) {
+  var mask = ee.Image.constant(1).clip(geometry).mask().not()
+  return image.updateMask(mask)
+}
+
+//Aglorithm for Determining NDSI
+function getNDSI(img) {
+  
+  var vir = img.select('green');
+  var swir = img.select('swir1');
+  
+  var image_ndsi = vir.subtract(swir).divide(vir.add(swir)).rename('NDSI');
+  
+  return img.addBands(image_ndsi)
+
+}
+
+//Aglorithm for Determining NDFSI
+function getNDFSI(img) {
+  
+  var nir = img.select('nir');
+  var swir2 = img.select('swir2');
+  
+  var image_ndfsi = nir.subtract(swir2).divide(nir.add(swir2)).rename('NDFSI');
+  
+  return img.addBands(image_ndfsi)
+
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// Glacerized Areas ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// TRAIN ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+
+var train_st = '2018-01-01'
+var train_ed = '2020-12-01'
+
+//Load in Landsat Images 
+//Standardize names, filter for cloud cover, filter to study period & area, clip to study area
+var Land_train_cf = ee.ImageCollection('LANDSAT/LC08/C01/T1_SR').select(L8_BANDS, STD_NAMES).map(function(img){return img.set('sensor','L8')})
+    .filterMetadata("CLOUD_COVER", "less_than", 10)
+    .filterBounds(aoi_train)
+    .filterDate('2016-01-01', '2020-12-30')
+    .select(STD_NAMES)
+    .map(function(img) {
+      var img = img.mask(waterMask)
+      return img.clip(aoi_train).toFloat()}) //FIX: cast to float here
+    .map(cloudMask_train)
+    .select('red', 'green', 'blue', 'nir', 'swir1', 'swir2') //change here to select which bands get used in the composite
+    .filter(ee.Filter.calendarRange(6,9, 'month'))
+    .sort('CLOUD_COVER')
+
+
+print(Land_train_cf, "Initial Landsat Collection - Training")
+
+var land_train = Land_train_cf.first()
+
+print(land_train, 'Landsat Training Image')
+
+// training region is the full image
+var training_L8 = land_train.sample({
+  region: aoi_train,
+  scale: resolution,
+  numPixels: 5000
+});
+
+//Load in Sentinel Images 
+//Standardize names, filter for cloud cover, filter to study period & area, clip to study area
+var S2_train_cf = ee.ImageCollection('COPERNICUS/S2')  
+  .filterDate('2016-01-01', '2020-12-30')
+  .filterBounds(aoi_train)
+  .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 10))
+  .map(sentinel2)
+  .map(function(img){return img.set('sensor','S2')})
+   .select(S2_BANDS, STD_NAMES )
+  .map(function(img) {
+      var img1 = img.mask(waterMask)
+      var img2 = img1.addBands(img.divide(10000),STD_NAMES,true).clip(aoi_train); 
+      return img2.set('sensor','S2').toFloat()}) //FIX: cast to float here 
+  .select('red', 'green', 'blue', 'nir', 'swir1', 'swir2')//change here to select which bands get used in the composite
+  .filter(ee.Filter.calendarRange(6,9, 'month'))
+  .sort('CLOUDY_PIXEL_PERCENTAGE')
+
+
+print(S2_train_cf, 'Initial Sentinel-2 Collection - Training')
+
+var sen_train = S2_train_cf.first()
+
+// training region is the full image
+var training_S2 = sen_train.sample({
+  region: aoi_train,
+  scale: resolution,
+  numPixels: 5000
+});
+
+
+// TEST ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+//Load in Landsat Images 
+//Standardize names, filter for cloud cover, filter to study period & area, clip to study area
+var Land_ice =ee.ImageCollection('LANDSAT/LC08/C01/T1_SR').select(L8_BANDS, STD_NAMES).map(function(img){return img.set('sensor','L8')})
+    .filterMetadata("CLOUD_COVER", "less_than", max_cloudy_percent)
+    .filterBounds(aoi_test)
+    .filterDate(ts_start, ts_end)
+    .select(STD_NAMES)
+    .map(function(img) {
+      var img = img.mask(waterMask)
+      return img.clip(aoi_test).toFloat()}) //FIX: cast to float here
+    .map(cloudMask_test)
+    .select('red', 'green', 'blue', 'nir', 'swir1', 'swir2') 
+
+print(Land_ice, 'Initial Landsat Collection - Testing')
+
+//Load in Sentinel Images 
+//Standardize names, filter for cloud cover, filter to study period & area, clip to study area
+var S2_ice = ee.ImageCollection('COPERNICUS/S2')  
+  .filterDate(ts_start, ts_end)
+  .filterBounds(aoi_test)
+  .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', max_cloudy_percent))
+  .map(sentinel2)
+  .map(function(img){return img.set('sensor','S2').clip(aoi_test)})
+   .select(S2_BANDS, STD_NAMES )
+  .map(function(img) { 
+      var img1 = img.mask(waterMask)
+      var img2 = img1.addBands(img.divide(10000),STD_NAMES,true); 
+      return img2.set('sensor','S2').toFloat()}) //FIX: cast to float here 
+  .select('red', 'green', 'blue', 'nir', 'swir1', 'swir2')
+  
+  print(S2_ice, 'Initial Sentinel-2 Collection - Testing')
+  
+
+//Make clusterer
+
+var clusterer_L8 = ee.Clusterer.wekaKMeans(2).train(training_L8)
+print(clusterer_L8, 'Trained K Meaned Classifier - Landsat 8')
+
+var clusterer_S2 = ee.Clusterer.wekaKMeans(2).train(training_S2)
+print(clusterer_S2, 'Trained K Meaned Classifier - Sentinel 2')
+
+//apply your clusterer Sentinel 
+
+var col_clustered_S2 = S2_ice.map(function (img) { return img.cluster(clusterer_S2)})
+
+print(col_clustered_S2, 'Classified Combined Image Collection ')
+
+//Get dates for your combined image collection 
+
+var col_dates_S2 = S2_ice.map(function(img){return addDateBands(img)})
+
+print(col_dates_S2, 'Metadata for Combined Image Collection')
+
+var days_S2 = col_dates_S2.select('calDoy', 'millis')
+
+// APPLY THE JOIN to add dates to clustered images 
+
+var out_d_S2 = ee.ImageCollection(simpleJoin.apply(days_S2,col_clustered_S2,filter))
+var out_vh_S2 = ee.ImageCollection(simpleJoin.apply(col_clustered_S2,days_S2,filter))
+      
+// FINAL IMAGE COL WITH DATE BAND AND clustered scenes 
+      
+var final_col_S2 = ee.ImageCollection(out_vh_S2.map(function(img){
+
+        // Create a collection with 1 image
+        var temp = ee.ImageCollection(ee.List([img]));
+
+        // Apply join to collection 2
+        // Resulting collection will have 1 image with exact same date as img
+        var join = simpleJoin.apply(out_d_S2, temp, filter);
+
+        // Get resulting image
+        var i2 = ee.Image(join.first())
+
+      return img.addBands(i2)
+      }))
+
+
+//Mask images so they only contain ice covered regions (snow is null)
+var col_no_snow_S2 = final_col_S2.map(function (img){
+  var clus = img.select('cluster')
+  var mil = img.select('millis')
+  var day = img.select('calDoy')
+  var no_snow = clus.eq(1)
+  var img_i = day.mask(no_snow)
+  var img_i = img_i.addBands(mil) 
+  return img_i.selfMask()
+})
+
+
+//apply your clusterer to Landsat
+
+var col_clustered_L8 = Land_ice.map(function (img) { return img.cluster(clusterer_L8)})
+
+print(col_clustered_L8, 'Classified Landsat Image Collection ')
+
+//Get dates for your combined image collection 
+
+var col_dates_L8 = Land_ice.map(function(img){return addDateBands(img)})
+
+print(col_dates_L8, 'Metadata for Combined Image Collection')
+
+var days_L8 = col_dates_L8.select('calDoy', 'millis')
+
+// APPLY THE JOIN to add dates to clustered images 
+
+var out_d_L8 = ee.ImageCollection(simpleJoin.apply(days_L8,col_clustered_L8,filter))
+var out_vh_L8 = ee.ImageCollection(simpleJoin.apply(col_clustered_L8,days_L8,filter))
+      
+// FINAL IMAGE COL WITH DATE BAND AND clustered scenes 
+      
+var final_col_L8 = ee.ImageCollection(out_vh_L8.map(function(img){
+
+        // Create a collection with 1 image
+        var temp = ee.ImageCollection(ee.List([img]));
+
+        // Apply join to collection 2
+        // Resulting collection will have 1 image with exact same date as img
+        var join = simpleJoin.apply(out_d_L8, temp, filter);
+
+        // Get resulting image
+        var i2 = ee.Image(join.first())
+
+      return img.addBands(i2)
+      }))
+
+
+//Mask images so they only contain ice covered regions (snow is null)
+var col_no_snow_L8 = final_col_S2.map(function (img){
+  var clus = img.select('cluster')
+  var mil = img.select('millis')
+  var day = img.select('calDoy')
+  var no_snow = clus.eq(1)
+  var img_i = day.mask(no_snow)
+  var img_i = img_i.addBands(mil) 
+  return img_i.selfMask()
+})
+
+//combine classified Image
+var fin_col = col_no_snow_L8.merge(col_no_snow_S2)
+
+
+//Reduce combined collection to image with first day of snow cover (extract the first non null)
+var noSnowImg = fin_col
+
+    // Sort the images by time.
+    .sort('millis')
+    // Select DOY 
+    .select('calDoy')
+    
+    //Since we have masked out all values representing snow covered conditions (NDFSI or NDSI > 0.4)
+    //Just take the first non Null value in the collection per pixel, to get the snow free date per pixel
+    .reduce(ee.Reducer.firstNonNull())
+
+    // Rename the DOY band - band names were altered by previous operation.
+    .rename(['calDoy'])
+    //.clip(LJB)
+
+print(noSnowImg, 'First Snow Free Day per Pixel - Glaciers')
+
+//Map.addLayer(noSnowImg, imageVisParam_snowfree, 'First Snow Free Date Per Pixel')
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// Non-Glacerized Areas ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+
+//Update Cloud Masks
+var sentinel2 = function(image) {
+  
+  //Uncomment line below if you have an ice mask 
+  var image = maskInside(image, ICE)
+
+  var cloud_mask = image.select("QA60");
+  var opaque = computeQAbits(cloud_mask, 10, 10, "opaque");
+  var cirrus = computeQAbits(cloud_mask, 11, 11, "cirrus");
+  var mask = opaque.or(cirrus);
+
+  return image.updateMask(mask.not());
+}
+
+  var cloudMask = function(img){
+    
+    var temp = img.addBands(img.select('tir').unitScale(240,270)); 
+    temp = temp.addBands(temp.normalizedDifference(['tir_1','swir2']))
+    temp = temp.addBands(temp.select('nd').gt(0.4).rename('clear'));
+    temp = temp.addBands(temp.select('nd').lte(0.4).rename('cloud'));
+    var mask = ee.Image(1).updateMask(temp.select('cloud')).byte().reduceToVectors({geometry: aoi, crs: 'EPSG:3005', scale: 300, maxPixels: 1e13})
+      .map(function(ft){return ft})
+    var maskImg = ee.Image(1).subtract(ee.Image(1).clipToCollection(mask).unmask())
+    
+    return img.updateMask(maskImg)}
+    
+
+// LANDSAT ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+//Load in Landsat Images 
+//Standardize names, filter for cloud cover, filter to study period & area, clip to study area, add NDFSI/NDSI bands
+var Landsat = ee.ImageCollection('LANDSAT/LC08/C01/T1_SR').select(L8_BANDS, STD_NAMES).map(function(img){return img.set('sensor','L8')})
+    .filterMetadata("CLOUD_COVER", "less_than", max_cloudy_percent)
+    .filterBounds(aoi)
+    .filterDate(ts_start, ts_end)
+    .select(STD_NAMES)
+    .map(function(img) {
+      var img = maskInside(img, ICE) 
+      return img.clip(aoi)})
+    .map(cloudMask)
+    .map(getNDSI)
+    .map(getNDFSI)
+    .select('NDSI', 'NDFSI')
+
+print(Landsat, "Initial Landsat Collection")
+
+//Remove Snow Free Pixels 
+var L8_no_snow = Landsat.map(function(img) {
+  var img8 = addDateBands(img) //add Date info to image and save as new variable
+  var img8 = img8.clip(aoi) //clip to study area 
+  var doy = img8.select('calDoy') //isolate DOY band
+  var m = img8.select('millis') //isolate milllis band
+  var img = img.focal_mean()
+  var img1 = img.select('NDFSI') //select NDFSI
+  var img2 = img.select('NDSI') //select NDSI
+  var i_snow = img1.lt(0.4).or(img2.lt(0.4)) //select only the areas in images where the indices are < 0.4 (snow free)
+  var img = img.addBands(doy) //add isolated DOY band to original image
+  var img = img.addBands(m) //add isolated millis band to original image
+  var img = img.mask(i_snow) //use your snow free mask to keep only snow free parts of images
+  return img.selfMask() //set the masked areas (snow covered regions) to null 
+})
+
+print(L8_no_snow, 'L8 Snow Cover Masked')
+
+// Sentinel /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+//Load in Sentinel Images 
+//Standardize names, filter for cloud cover, filter to study period & area, clip to study area, add NDFSI/NDSI bands
+var S2 = ee.ImageCollection('COPERNICUS/S2')
+  .filterDate(ts_start, ts_end)
+  .filterBounds(aoi)
+  .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', max_cloudy_percent))
+  .map(sentinel2)
+  .select(S2_BANDS, STD_NAMES )
+  .map(function(img){return img.set('sensor','S2')})
+  .map(function(img) {var img2 = img.addBands(img.divide(10000),STD_NAMES,true).clip(aoi); 
+      return img2.set('sensor','S2')}) 
+  .map(getNDSI)
+  .map(getNDFSI)
+  .map(function (img) {return img.select('NDSI', "NDFSI")})
+
+print(S2, 'Initial S2 Collection ')
+
+  
+//Remove Snow Free Pixels 
+var S2_no_snow = S2.map(function(img) {
+  var img8 = addDateBands(img) //add Date info to image and save as new variable
+  var img8 = img8.clip(aoi) //clip to study area 
+  var doy = img8.select('calDoy') //isolate DOY band
+  var m = img8.select('millis') //isolate milllis band 
+  var img = img.focal_mean()
+  var img1 = img.select('NDFSI') //select NDFSI
+  var img2 = img.select('NDSI') //select NDSI
+  var i_snow = img1.lt(0.4).or(img2.lt(0.4)) //select only the areas in images where the indices are < 0.4 (snow free)
+  var img = img.addBands(doy) //add isolated DOY band to original image
+  var img = img.addBands(m) //add isolated millis band to original image
+  var img = img.mask(i_snow) //use your snow free mask to keep only snow free parts of images
+  return img.selfMask() //set the masked areas (snow covered regions) to null 
+})
+
+print(S2_no_snow, 'S2 Snow Cover Masked')
+
+
+// Fusion Snow Cover Analysis  //////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+//Combine Collection 
+var col_combo = S2_no_snow.merge(L8_no_snow)
+print(col_combo, 'Combined Landsat and Sentinel Collections')
+
+//Reduce combined collection to image with first day of snow cover 
+var noSnow = col_combo
+
+    // Sort the images by time.
+    .sort('millis')
+    // Select DOY 
+    .select('calDoy')
+    
+    //Since we have masked out all values representing snow covered conditions (NDFSI or NDSI > 0.4)
+    //Just take the first non Null value in the collection per pixel, to get the snow free date per pixel
+    .reduce(ee.Reducer.firstNonNull())
+
+    // Rename the DOY band - band names were altered by previous operation.
+    .rename(['calDoy'])
+
+print(noSnow, 'First Snow Free Day per Pixel')
+
+//Water Mask 
+var firstDayNoSnow = noSnow.updateMask(waterMask)
+
+print(firstDayNoSnow, 'First Snow Free Day per Pixel, water masked')
+
+//Map it.
+Map.addLayer(firstDayNoSnow.select('calDoy'), imageVisParam_snowfree, 'Snow Free Estimates')
+
+var img_col = ee.ImageCollection.fromImages([noSnowImg.select('calDoy'), firstDayNoSnow.select('calDoy')])
+
+var final = img_col.mosaic()
+
+print(final, 'Combined Image with Glacerized and Non-Glacerized Snow Free Estimates')
+//Export it 
+Export.image.toDrive({  
+        image: final, 
+        description: startYear + '_fusion_snow_off',
+        folder: fol,
+        scale: resolution,
+        region:aoi,
+        });
