@@ -1,0 +1,336 @@
+/**** Start of imports. If edited, may not auto-convert in the playground. ****/
+var LJB_DEM = ee.Image("users/saradarychuk/SRTM_Lajoie_resamp"),
+    LJB = ee.FeatureCollection("users/saradarychuk/LaJoie_Basin"),
+    SAR_vis = {"opacity":1,"bands":["VV"],"min":-30,"max":10,"palette":["3f61c2","e7fff6"]};
+/***** End of imports. If edited, may not auto-convert in the playground. *****/
+// Export Sentinel-1 SAR Images for Snowmelt Analysis////////////////////////////////////////////////////////////////////////////////
+
+// From Darychuk et al. (2023) 
+// "Snowmelt Characterization from Optical and Synthetic Aperture Radar Observations in the La Joie Basin, British Columbia"
+// Author: S. Darychuk
+
+//For large basins, run in intervals of 2 months. 
+
+//PARAMETERS////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+//Output folder for SAR images 
+var fol = "SAR_img_LIA" + startyear
+
+//Study Area  
+var aoi = LJB
+ 
+//Polarization
+var pol = 'VV'
+
+//Year
+var startyear = 2021; //Adjust these to your required study year 
+var endyear = startyear; //Adjust these to your required study year 
+
+//Months
+var startmonth = 6  
+var endmonth = 6
+
+//Days
+var startday = 1
+var endday = 30
+
+//Start and ending dates
+var startdate = ee.Date.fromYMD(startyear,startmonth,startday);
+var enddate = ee.Date.fromYMD(endyear,endmonth,endday);
+
+//Desired resolution of outputted images 
+var resolution = 30
+
+//DEM
+var DEM = ee.Image(LJB_DEM)
+
+//Create a watermask
+var waterOcc = ee.Image("JRC/GSW1_0/GlobalSurfaceWater").select('occurrence'),
+    jrc_data0 = ee.Image("JRC/GSW1_0/Metadata").select('total_obs').lte(0),
+    waterOccFilled = waterOcc.unmask(0).max(jrc_data0),
+    waterMask = waterOccFilled.lt(50), 
+    waterMask = waterMask.clip(aoi);
+ 
+// Create an equal filter to match image collections
+ var filter = ee.Filter.equals({
+  leftField: 'system:index',
+  rightField: 'system:index'
+});
+
+// Create a simple join
+var simpleJoin = ee.Join.simple();
+
+//FUNCTIONS ///////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Correction function for radiometric slope correction on a Sentinel-1 image collection - 
+// From Vollrath et al. 2020
+// "Angular-Based Radiometric Slope Correction for Sentinel-1 on Google Earth Engine"
+
+
+var slope_correction = function (collection,
+                                 options
+                                 ){
+ 
+    // set defaults if undefined options
+    options = options || {};
+    var model = options.model || 'volume';
+    var elevation = options.elevation || ee.Image(LJB_DEM);
+    var buffer = options.buffer || 0;
+
+    // we need a 90 degree in radians image for a couple of calculations
+    var ninetyRad = ee.Image.constant(90).multiply(Math.PI/180);
+
+    // Volumetric Model Hoekman 1990
+    function _volume_model(theta_iRad, alpha_rRad){
+
+      var nominator = (ninetyRad.subtract(theta_iRad).add(alpha_rRad)).tan();
+      var denominator = (ninetyRad.subtract(theta_iRad)).tan();
+      return nominator.divide(denominator);
+    }
+
+    // surface model Ulander et al. 1996
+    function _surface_model(theta_iRad, alpha_rRad, alpha_azRad){
+
+      var nominator = (ninetyRad.subtract(theta_iRad)).cos();
+      var denominator = alpha_azRad.cos()
+        .multiply((ninetyRad.subtract(theta_iRad).add(alpha_rRad)).cos());
+      return nominator.divide(denominator);
+    }
+
+    // buffer function (thanks Noel)
+    function _erode(img, distance) {
+
+      var d = (img.not().unmask(1)
+          .fastDistanceTransform(30).sqrt()
+          .multiply(ee.Image.pixelArea().sqrt()));
+
+      return img.updateMask(d.gt(distance));
+    }
+
+    // calculate masks
+    function _masking(alpha_rRad, theta_iRad, proj, buffer){
+
+        // layover, where slope > radar viewing angle
+        var layover = alpha_rRad.lt(theta_iRad).rename('layover');
+
+        // shadow
+        var shadow = alpha_rRad.gt(ee.Image.constant(-1).multiply(ninetyRad.subtract(theta_iRad))).rename('shadow');
+
+        // combine layover and shadow
+        var mask = layover.and(shadow);
+
+        // add buffer to final mask
+        if (buffer > 0)
+            mask = _erode(mask, buffer);
+
+        return mask.rename('no_data_mask');
+   }
+
+    function _correct(image){
+
+        // get image geometry and projection
+        var geom = image.geometry();
+        var proj = image.select(1).projection();
+
+        // get look direction angle
+        var heading = (ee.Terrain.aspect(
+            image.select('angle')).reduceRegion(ee.Reducer.mean(), geom, 1000).get('aspect')
+            );
+
+        // Sigma0 to Power of input image
+        var sigma0Pow = ee.Image.constant(10).pow(image.divide(10.0));
+
+        // Radar geometry
+        var theta_iRad = image.select('angle').multiply(Math.PI/180).clip(geom);
+        var phi_iRad = ee.Image.constant(heading).multiply(Math.PI/180); 
+
+        // Terrain geometry
+        var alpha_sRad = ee.Terrain.slope(elevation).select('slope')
+            .multiply(Math.PI/180).setDefaultProjection(proj).clip(geom);
+        var phi_sRad = ee.Terrain.aspect(elevation).select('aspect')
+            .multiply(Math.PI/180).setDefaultProjection(proj).clip(geom);
+
+        // Model geometry
+
+        //reduce to 3 angle
+        var phi_rRad = phi_iRad.subtract(phi_sRad);
+
+        // slope steepness in range
+        var alpha_rRad = (alpha_sRad.tan().multiply(phi_rRad.cos())).atan();
+
+        // slope steepness in azimuth
+        var alpha_azRad = (alpha_sRad.tan().multiply(phi_rRad.sin())).atan();
+
+        // Gamma_nought
+        var gamma0 = sigma0Pow .divide(theta_iRad.cos());
+
+               // models
+        if (model == 'volume')
+          var corrModel = _volume_model(theta_iRad, alpha_rRad);
+
+        if (model == 'surface')
+          var corrModel = _surface_model(theta_iRad, alpha_rRad, alpha_azRad);
+
+        if (model == 'direct')
+          var corrModel = _direct_model(theta_iRad, alpha_rRad, alpha_azRad);
+
+        // apply model to derive gamma0_flat
+        var gamma0_flat = gamma0.divide(corrModel);
+
+        // transform to dB-scale
+        var gamma0_flatDB = (ee.Image.constant(10)
+            .multiply(gamma0_flat.log10()).select(['VV', 'VH'])
+            );
+
+        // get Layover/Shadow mask
+        var mask = _masking(alpha_rRad, theta_iRad, proj, buffer);
+
+        // return gamma_flat plus mask
+        return gamma0_flatDB.addBands(mask).copyProperties(image);
+
+
+    }
+
+    // run correction function and return corrected collection
+    return collection.map(_correct);
+
+};
+
+
+//Speckle Removal/
+//Source code: https://code.earthengine.google.com/d7fe02d27c45b4f296f22889705b6b07
+
+function powerToDb(img){
+  return ee.Image(10).multiply(img.log10());
+}
+
+function dbToPower(img){
+  return ee.Image(10).pow(img.divide(10));
+}
+
+function gammaMap(img){
+
+  var ksize = 7;
+  var enl = 5;
+  var bandNames = img.bandNames();
+  
+  // Convert image from dB to natural values
+  var nat_img = dbToPower(img);
+
+  // Square kernel, ksize should be odd (typically 3, 5 or 7)
+  var weights = ee.List.repeat(ee.List.repeat(1,ksize),ksize);
+  
+  // ~~(ksize/2) does integer division in JavaScript
+  var kernel = ee.Kernel.fixed(ksize,ksize, weights, ~~(ksize/2), ~~(ksize/2), false);
+
+  // Get mean and variance
+  var mean = nat_img.reduceNeighborhood(ee.Reducer.mean(), kernel);
+  var variance = nat_img.reduceNeighborhood(ee.Reducer.variance(), kernel);
+
+  // "Pure speckle" threshold
+  var ci = variance.sqrt().divide(mean);  // square root of inverse of enl
+
+  // If ci <= cu, the kernel lies in a "pure speckle" area -> return simple mean
+  var cu = 1.0/Math.sqrt(enl);
+  
+  // If cu < ci < cmax the kernel lies in the low textured speckle area -> return the filtered value
+  var cmax = Math.sqrt(2.0) * cu
+
+  var alpha = ee.Image(1.0 + cu*cu).divide(ci.multiply(ci).subtract(cu*cu));
+  var b = alpha.subtract(enl + 1.0)
+  var d = mean.multiply(mean).multiply(b).multiply(b).add(alpha.multiply(mean).multiply(nat_img).multiply(4.0*enl));
+  var f = b.multiply(mean).add(d.sqrt()).divide(alpha.multiply(2.0));
+  
+  var caster = ee.Dictionary.fromLists(bandNames,ee.List.repeat('float',3));
+  var img1 = powerToDb(mean.updateMask(ci.lte(cu))).rename(bandNames).cast(caster);
+  var img2 = powerToDb(f.updateMask(ci.gt(cu)).updateMask(ci.lt(cmax))).rename(bandNames).cast(caster);
+  var img3 = img.updateMask(ci.gte(cmax)).rename(bandNames).cast(caster);
+  
+  // If ci > cmax do not filter at all (i.e. we don't do anything, other then masking)
+  var result = ee.ImageCollection([img1,img2,img3])
+    .reduce(ee.Reducer.firstNonNull()).rename(bandNames);
+  
+  // Compose a 3 band image with the mean filtered "pure speckle", the "low textured" filtered and the unfiltered portions
+  return result;
+}
+
+
+// LOAD AND ANALYZE SENTINEL-1 DATA //////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// DESCENDING 
+
+//PREP THE DESCENDING COLLECTION  
+var desc = ee.ImageCollection('COPERNICUS/S1_GRD')
+        .filter(ee.Filter.listContains('transmitterReceiverPolarisation', pol))
+        .filter(ee.Filter.eq('instrumentMode', 'IW'))
+        .select('VV','VH', 'angle')
+        .filterBounds(aoi)
+        .filterDate(startdate, enddate)
+        .filterMetadata('resolution_meters', 'equals' , 10)
+        .filter(ee.Filter.eq('orbitProperties_pass', 'DESCENDING'))
+        .map(function (image){
+          var day = ee.Image.constant(ee.Number.parse(image.date().format("D"))).rename('day').toDouble()
+          return image.addBands(day)
+        }) //Adds day band for extracting date of minimum value 
+
+print(desc, 'Original Descending Collection')
+
+// APPLY THE SLOPE CORRECTION 
+
+var desc_vol= slope_correction(desc,
+    {'model': 'volume',//Model to use 
+     'elevation': DEM, //Your elevation Model
+     'buffer': 30       //Buffer Distance (m)
+    }) 
+
+print(desc_vol.first(), 'First Corrected Descending Image')
+
+//CLIP IMAGES TO AOI, APPLY WATER MASK, APPLY NO DATA MASK
+var desc_vol_i = desc_vol.map(function (image) {
+          var img = image.clip(aoi)
+          var img = img.updateMask(waterMask)
+          var img = gammaMap(img)
+          var nodat = img.select('no_data_mask')
+          return img.updateMask(nodat)
+        })
+
+print(desc_vol_i, 'Desc Collection Volume Corrected, Speckle Filtered, & Masked')
+Map.addLayer(desc_vol_i.first(), SAR_vis, 'Corrected,masked & filtered')
+Map.addLayer(desc.first().clip(aoi), SAR_vis, 'Original Image')
+Map.addLayer(desc_vol.first().clip(aoi), SAR_vis, 'Corrected')
+
+// EXTRACT DATE BANDS 
+
+var days = desc.select('day')
+
+// APPLY THE JOIN 
+
+var out_d = ee.ImageCollection(simpleJoin.apply(days,desc_vol_i,filter))
+var out_vh = ee.ImageCollection(simpleJoin.apply(desc_vol_i,days,filter))
+      
+// FINAL IMAGE COL WITH DATE BAND AND CORRECTED BACKSCATTER VALUES
+      
+var final_col_d = ee.ImageCollection(out_vh.map(function(img){
+
+        var temp = ee.ImageCollection(ee.List([img]));
+        var join = simpleJoin.apply(out_d, temp, filter);
+        var out_img = ee.Image(join.first())
+
+      return img.addBands(out_img)
+      }))
+
+
+print(final_col_d.first())
+
+var out_col = final_col_d.select(pol, 'day')
+
+print(out_col.first())
+
+//EXPORT IMAGES//////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+var batch = require('users/fitoprincipe/geetools:batch')
+
+batch.Download.ImageCollection.toDrive(out_col, fol, 
+                {scale: resolution, 
+                 region: aoi, 
+                 type: 'float'})
